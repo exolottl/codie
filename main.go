@@ -12,6 +12,9 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// Default maximum chunk size for code splitting
+const DefaultMaxChunkSize = 8000
+
 func main() {
 	// Load environment variables
 	err := godotenv.Load()
@@ -25,10 +28,26 @@ func main() {
 	dir := os.Args[1]
 	
 	// Get all code files from the directory
-	files := fileutils.GetCodeFiles(dir)
+	files, err := fileutils.GetCodeFiles(dir)
+	if err != nil {
+		log.Fatalf("Error scanning directory: %v", err)
+	}
+	
+	if len(files) == 0 {
+		log.Fatal("No code files found in the specified directory")
+	}
+	
+	fmt.Printf("Found %d code files to process\n", len(files))
 	
 	// Process each file and get code chunks with embeddings
-	chunks := processFiles(files)
+	chunks, err := processFiles(files)
+	if err != nil {
+		log.Fatalf("Error processing files: %v", err)
+	}
+	
+	if len(chunks) == 0 {
+		log.Fatal("No code chunks were processed successfully")
+	}
 	
 	// Save the results to a JSON file
 	err = storage.SaveToJSON(chunks, "embeddings.json")
@@ -36,27 +55,35 @@ func main() {
 		log.Fatalf("Failed to save embeddings: %v", err)
 	}
 	
+	fmt.Printf("Successfully processed %d code chunks\n", len(chunks))
 	fmt.Println("Embeddings saved to embeddings.json")
 }
 
-func processFiles(files []string) []storage.CodeChunk {
+func processFiles(files []string) ([]storage.CodeChunk, error) {
 	var chunks []storage.CodeChunk
-
-	for _, file := range files {
-		content, err := os.ReadFile(file)
+	totalFiles := len(files)
+	
+	for i, file := range files {
+		fmt.Printf("Processing file %d/%d: %s\n", i+1, totalFiles, file)
+		
+		content, err := fileutils.ReadFileContent(file)
 		if err != nil {
 			log.Printf("Failed to read file %s: %v", file, err)
 			continue
 		}
 		
-		code := string(content)
 		// Split code into chunks
-		chunkedCode := fileutils.SplitCodeIntoChunks(code)
+		chunkedCode := fileutils.SplitCodeIntoChunks(content, DefaultMaxChunkSize)
+		fmt.Printf("  Split into %d chunks\n", len(chunkedCode))
 		
 		// Process each chunk
-		for _, chunk := range chunkedCode {
+		for j, chunk := range chunkedCode {
 			// Get embedding for the chunk
-			embedding := embeddings.GetEmbedding(chunk)
+			embedding, err := embeddings.GetEmbedding(chunk)
+			if err != nil {
+				log.Printf("  Failed to get embedding for chunk %d in %s: %v", j+1, file, err)
+				continue
+			}
 			
 			// Create a CodeChunk struct and append to the list
 			chunks = append(chunks, storage.CodeChunk{
@@ -67,5 +94,5 @@ func processFiles(files []string) []storage.CodeChunk {
 		}
 	}
 	
-	return chunks
+	return chunks, nil
 }
