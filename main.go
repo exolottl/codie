@@ -15,10 +15,10 @@ import (
 const DefaultMaxChunkSize = 8000
 
 func main() {
-	// Initialize configuration
+	// Initialize configuration with API key validation
 	err := config.Init()
 	if err != nil {
-		log.Fatalf("Failed to initialize configuration: %v", err)
+		log.Fatalf("Configuration error: %v", err)
 	}
 
 	if len(os.Args) < 2 {
