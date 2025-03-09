@@ -5,21 +5,20 @@ import (
 	"log"
 	"os"
 
+	"codie/internal/config"
 	"codie/internal/embeddings"
 	"codie/internal/fileutils"
 	"codie/internal/storage"
-
-	"github.com/joho/godotenv"
 )
 
 // Default maximum chunk size for code splitting
 const DefaultMaxChunkSize = 8000
 
 func main() {
-	// Load environment variables
-	err := godotenv.Load()
+	// Initialize configuration
+	err := config.Init()
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		log.Fatalf("Failed to initialize configuration: %v", err)
 	}
 
 	if len(os.Args) < 2 {
