@@ -1,4 +1,4 @@
-module ai-dev
+module codie
 
 go 1.22.12
 

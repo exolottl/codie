@@ -1,31 +1,46 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"strings"
+
+	"codie/internal/embeddings"
+	"codie/internal/fileutils"
+	"codie/internal/storage"
 
 	"github.com/joho/godotenv"
-	"github.com/sashabaranov/go-openai"
 )
 
-type CodeChunk struct {
-	File    string `json:"file"`
-	Content string `json:"content"`
-	Embedding []float32 `json:"embedding"`
-}
-
 func main() {
+	// Load environment variables
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
 	if len(os.Args) < 2 {
 		log.Fatal("Usage: go run main.go <directory>")
 	}
 	dir := os.Args[1]
-	files := getCodeFiles(dir)
-	var chunks []CodeChunk
+	
+	// Get all code files from the directory
+	files := fileutils.GetCodeFiles(dir)
+	
+	// Process each file and get code chunks with embeddings
+	chunks := processFiles(files)
+	
+	// Save the results to a JSON file
+	err = storage.SaveToJSON(chunks, "embeddings.json")
+	if err != nil {
+		log.Fatalf("Failed to save embeddings: %v", err)
+	}
+	
+	fmt.Println("Embeddings saved to embeddings.json")
+}
+
+func processFiles(files []string) []storage.CodeChunk {
+	var chunks []storage.CodeChunk
 
 	for _, file := range files {
 		content, err := os.ReadFile(file)
@@ -33,56 +48,24 @@ func main() {
 			log.Printf("Failed to read file %s: %v", file, err)
 			continue
 		}
-		code := string(content)
-		// Simple chunking by functions and classes (improve with regex/AST parsing)
-		chunkedCode := splitCodeIntoChunks(code)
 		
+		code := string(content)
+		// Split code into chunks
+		chunkedCode := fileutils.SplitCodeIntoChunks(code)
+		
+		// Process each chunk
 		for _, chunk := range chunkedCode {
-			embedding := getEmbedding(chunk)
-			chunks = append(chunks, CodeChunk{File: file, Content: chunk, Embedding: embedding})
+			// Get embedding for the chunk
+			embedding := embeddings.GetEmbedding(chunk)
+			
+			// Create a CodeChunk struct and append to the list
+			chunks = append(chunks, storage.CodeChunk{
+				File:      file, 
+				Content:   chunk, 
+				Embedding: embedding,
+			})
 		}
 	}
-
-	output, _ := json.MarshalIndent(chunks, "", "  ")
-	os.WriteFile("embeddings.json", output, 0644)
-	fmt.Println("Embeddings saved to embeddings.json")
-}
-
-func getCodeFiles(root string) []string {
-	var files []string
-	extensions := []string{".py", ".js", ".ts", ".cpp", ".go", ".java", ".lua"}
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err == nil && !info.IsDir() {
-			for _, ext := range extensions {
-				if strings.HasSuffix(info.Name(), ext) {
-					files = append(files, path)
-					break
-				}
-			}
-		}
-		return nil
-	})
-	return files
-}
-
-func splitCodeIntoChunks(code string) []string {
-	return strings.Split(code, "\n\n")
-}
-
-func getEmbedding(text string) []float32 {
-  err := godotenv.Load()
-  if err != nil {
-    log.Fatal("Error loading .env file")
-  }
-  fmt.Printf(text)
-	client := openai.NewClient(os.Getenv("OPENAI_API_KEY"))
-	resp, err := client.CreateEmbeddings(context.Background(), openai.EmbeddingRequest{
-		Model: openai.AdaEmbeddingV2,
-		Input: []string{text},
-	})
-	if err != nil {
-		log.Printf("Embedding API error: %v", err)
-		return nil
-	}
-	return resp.Data[0].Embedding
+	
+	return chunks
 }
