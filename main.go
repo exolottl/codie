@@ -5,7 +5,8 @@ import (
 	"log"
 	"os"
 	"strings"
-
+	
+	"github.com/charmbracelet/glamour"
 	"codie/internal/config"
 	"codie/internal/embeddings"
 	"codie/internal/fileutils"
@@ -136,7 +137,8 @@ func summarizeCodebase(dir string, args []string) {
 
 	// Output the summary
 	fmt.Println("\n--- CODEBASE SUMMARY ---")
-	fmt.Println(summary)
+	output, _:= glamour.Render(summary, "dark")
+	fmt.Println(output)
 }
 
 func processFiles(files []string) ([]storage.CodeChunk, error) {

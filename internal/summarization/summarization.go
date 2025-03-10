@@ -184,7 +184,7 @@ func buildSummaryPrompt(repoStructure []FileStructure, fileChunks map[string][]s
 	var sb strings.Builder
 
 	// Basic instruction
-	sb.WriteString("Please provide a comprehensive summary of this codebase. ")
+	sb.WriteString("Please provide a basic and short yet whole summary of this codebase. ")
 	sb.WriteString("Describe the overall architecture, main components, and how they interact. ")
 	
 	if options.DetailLevel == "comprehensive" {
