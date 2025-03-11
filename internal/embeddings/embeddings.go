@@ -272,7 +272,7 @@ func GetBatchEmbeddings(texts []string, batchSize int) (map[string][]float32, er
 			for attempt := 1; attempt <= 3; attempt++ {
 				ctx, cancel := context.WithTimeout(context.Background(), DefaultAPITimeout)
 				resp, err = client.CreateEmbeddings(ctx, openai.EmbeddingRequest{
-					Model: openai.AdaEmbeddingV2,
+					Model: openai.SmallEmbedding3,
 					Input: textBatch,
 				})
 				cancel()

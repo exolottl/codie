@@ -6,15 +6,26 @@ Codie is a powerful CLI tool designed to help developers quickly understand and 
 
 ## 🛠 Requirements
 
-- Go 1.22 or higher
-- OpenAI API key (you'll be prompted to provide this on first run)
+- Go 1.18 or higher
+- OpenAI API key (you'll be prompted to provide this on first run, or you can set it in a `.env` file)
 
 ## 📥 Installation
 
 ```sh
-git clone https://github.com/exolottl/codie
+# Clone the repository 
+git clone https://github.com/yourusername/codie
 cd codie
+
+# Install dependencies
 go mod tidy
+```
+
+## 🔑 Environment Setup
+
+Create a `.env` file in the project root with your OpenAI API key:
+
+```
+OPENAI_API_KEY=your_api_key_here
 ```
 
 ## 🚀 Usage
@@ -46,11 +57,12 @@ For backward compatibility, running just `go run main.go <directory path>` will 
 
 ## 💡 How It Works
 
-1. **Code Scanning**: Codie scans your codebase for supported file types (.py, .js, .go, .java, etc.)
-2. **Smart Chunking**: Large files are broken into meaningful chunks for better analysis
-3. **AI Embeddings**: Code chunks are processed through OpenAI's embedding API
-4. **AI Analysis**: Codie builds a prompt based on your code and uses OpenAI's GPT-4o to generate insightful summaries
-5. **Structured Output**: Summaries include overview, architecture, key features, and implementation details
+1. **Code Scanning**: Codie scans your codebase for supported file types (.py, .js, .go, etc.)
+2. **Smart Chunking**: Files are broken into meaningful semantic chunks using Tree-sitter parsers for better analysis
+3. **Efficient Batch Processing**: Code chunks are processed in batches through OpenAI's embedding API for optimal performance
+4. **AI Embeddings**: Generated embeddings capture the semantic meaning of your code
+5. **AI Analysis**: Codie builds a prompt based on your code and uses OpenAI's models to generate insightful summaries
+6. **Structured Output**: Summaries include overview, architecture, key features, and implementation details
 
 ## 🤖 Features
 
@@ -58,6 +70,7 @@ For backward compatibility, running just `go run main.go <directory path>` will 
 - [x] **Code Repo Summarization** – AI-powered summaries for understanding large codebases
 - [x] **Focused Analysis** – Zoom in on specific directories or parts of your codebase
 - [x] **Configurable Detail Levels** – Choose between brief, standard, or comprehensive summaries
+- [x] **Syntax-Aware Parsing** – Uses Tree-sitter to understand code structure for smarter analysis
 
 ## 🔮 Upcoming Features
 
@@ -66,4 +79,22 @@ For backward compatibility, running just `go run main.go <directory path>` will 
 
 ## 🔧 Technical Details
 
-Codie uses OpenAI's embedding model (Ada) to process code chunks and GPT-4o for generating the final analysis. It's designed to work offline once the initial indexing is complete, making it ideal for working with private codebases.
+Codie uses a combination of technologies to provide intelligent code analysis:
+
+- **Tree-sitter** for language-specific parsing of code structures (functions, classes, methods)
+- **OpenAI's Ada-002** embedding model for semantic code processing
+- **OpenAI's GPT models** for generating the final analysis
+- **Concurrent processing** for efficient handling of large codebases
+- **Rate limiting** to manage API usage and prevent throttling
+
+## 📚 Dependencies
+
+- `github.com/charmbracelet/glamour` - For Markdown rendering in terminal
+- `github.com/schollz/progressbar/v3` - For progress visualization
+- `github.com/sashabaranov/go-openai` - OpenAI API client
+- `github.com/smacker/go-tree-sitter` - Code parsing and analysis
+- Tree-sitter language parsers for Go, JavaScript, Python, and more
+
+## 📄 License
+
+[MIT License](LICENSE)
