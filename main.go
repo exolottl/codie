@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
+	"runtime"
 	"strings"
+	"sync"
 	
 	"github.com/charmbracelet/glamour"
+	"github.com/schollz/progressbar/v3"
 	"codie/internal/config"
 	"codie/internal/embeddings"
 	"codie/internal/fileutils"
@@ -19,6 +23,12 @@ const DefaultMaxChunkSize = 8000
 
 // Default embeddings file name
 const DefaultEmbeddingsFile = "embeddings.json"
+
+// Default batch size for sending embeddings to API
+const DefaultBatchSize = 20
+
+// Default number of worker goroutines (0 means use NumCPU)
+const DefaultNumWorkers = 0
 
 func main() {
 	// Initialize configuration with API key validation
@@ -37,9 +47,6 @@ func main() {
 	switch command {
 	case "help":
 		//Print help message
-		if len(os.Args) < 2 {
-			log.Fatal("Usage: go run main.go help <command>")
-		}
 		printUsage()
 
 	case "index":
@@ -91,24 +98,146 @@ func indexCodebase(dir string) {
 	
 	fmt.Printf("Found %d code files to process\n", len(files))
 	
-	// Process each file and get code chunks with embeddings
-	chunks, err := processFiles(files)
-	if err != nil {
-		log.Fatalf("Error processing files: %v", err)
+	// Determine number of workers based on CPU cores
+	numWorkers := DefaultNumWorkers
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
 	}
 	
-	if len(chunks) == 0 {
-		log.Fatal("No code chunks were processed successfully")
+	// Set up concurrency channels and wait groups
+	filesChan := make(chan string, len(files))
+	resultsChan := make(chan []storage.CodeChunk, len(files))
+	errorsChan := make(chan error, len(files))
+	
+	// Create a progress bar
+	bar := progressbar.NewOptions(len(files),
+		progressbar.OptionSetDescription("Processing files"),
+		progressbar.OptionShowCount(),
+		progressbar.OptionShowIts(),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}))
+	
+	// Launch worker pool
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for file := range filesChan {
+				chunks, err := processFile(file)
+				if err != nil {
+					errorsChan <- fmt.Errorf("error processing %s: %w", file, err)
+				} else {
+					resultsChan <- chunks
+				}
+				bar.Add(1)
+			}
+		}()
+	}
+	
+	// Queue files for processing
+	for _, file := range files {
+		filesChan <- file
+	}
+	close(filesChan)
+	
+	// Start collector goroutine
+	var allChunks []storage.CodeChunk
+	var processingErrors []error
+	
+	go func() {
+		for err := range errorsChan {
+			processingErrors = append(processingErrors, err)
+		}
+	}()
+	
+	go func() {
+		for chunks := range resultsChan {
+			allChunks = append(allChunks, chunks...)
+		}
+	}()
+	
+	// Wait for all workers to finish
+	wg.Wait()
+	close(resultsChan)
+	close(errorsChan)
+	
+	// Wait a bit for collectors to finish
+	time.Sleep(100 * time.Millisecond)
+	
+	// Report errors (but continue with saving results)
+	if len(processingErrors) > 0 {
+		fmt.Printf("\nEncountered %d errors during processing:\n", len(processingErrors))
+		for i, err := range processingErrors {
+			if i < 10 { // Only show first 10 errors
+				fmt.Printf("- %v\n", err)
+			} else {
+				fmt.Printf("- ... and %d more errors\n", len(processingErrors)-10)
+				break
+			}
+		}
 	}
 	
 	// Save the results to a JSON file
-	err = storage.SaveToJSON(chunks, DefaultEmbeddingsFile)
+	if len(allChunks) > 0 {
+		fmt.Printf("\nSaving %d code chunks to %s...\n", len(allChunks), DefaultEmbeddingsFile)
+		err = storage.SaveToJSON(allChunks, DefaultEmbeddingsFile)
+		if err != nil {
+			log.Fatalf("Failed to save embeddings: %v", err)
+		}
+		fmt.Printf("Successfully processed %d code chunks\n", len(allChunks))
+	} else {
+		log.Fatal("No code chunks were processed successfully")
+	}
+}
+
+// processFile handles a single file, extracting and embedding its chunks
+func processFile(file string) ([]storage.CodeChunk, error) {
+	content, err := fileutils.ReadFileContent(file)
 	if err != nil {
-		log.Fatalf("Failed to save embeddings: %v", err)
+		return nil, fmt.Errorf("failed to read file: %w", err)
 	}
 	
-	fmt.Printf("Successfully processed %d code chunks\n", len(chunks))
-	fmt.Printf("Embeddings saved to %s\n", DefaultEmbeddingsFile)
+	// Split code into chunks
+	chunkedCode := fileutils.SplitCodeIntoChunks(content, DefaultMaxChunkSize)
+	if len(chunkedCode) == 0 {
+		return nil, nil // No valid chunks found
+	}
+	
+	// Prepare data for batch processing
+	var chunksToEmbed []string
+	fileChunks := make([]storage.CodeChunk, len(chunkedCode))
+	
+	for i, chunk := range chunkedCode {
+		chunksToEmbed = append(chunksToEmbed, chunk)
+		fileChunks[i] = storage.CodeChunk{
+			File:    file,
+			Content: chunk,
+			// Embedding will be added later
+		}
+	}
+	
+	// Get embeddings for all chunks in batch
+	embedMap, err := embeddings.GetBatchEmbeddings(chunksToEmbed, DefaultBatchSize)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get embeddings: %w", err)
+	}
+	
+	// Associate embeddings with their chunks
+	var validChunks []storage.CodeChunk
+	for i, chunk := range fileChunks {
+		if embedding, ok := embedMap[chunksToEmbed[i]]; ok {
+			chunk.Embedding = embedding
+			validChunks = append(validChunks, chunk)
+		}
+	}
+	
+	return validChunks, nil
 }
 
 // summarizeCodebase generates a summary of the codebase
@@ -146,42 +275,4 @@ func summarizeCodebase(dir string, args []string) {
 	fmt.Println("\n--- CODEBASE SUMMARY ---")
 	output, _:= glamour.Render(summary, "dark")
 	fmt.Println(output)
-}
-
-func processFiles(files []string) ([]storage.CodeChunk, error) {
-	var chunks []storage.CodeChunk
-	totalFiles := len(files)
-	
-	for i, file := range files {
-		fmt.Printf("Processing file %d/%d: %s\n", i+1, totalFiles, file)
-		
-		content, err := fileutils.ReadFileContent(file)
-		if err != nil {
-			log.Printf("Failed to read file %s: %v", file, err)
-			continue
-		}
-		
-		// Split code into chunks
-		chunkedCode := fileutils.SplitCodeIntoChunks(content, DefaultMaxChunkSize)
-		fmt.Printf("  Split into %d chunks\n", len(chunkedCode))
-		
-		// Process each chunk
-		for j, chunk := range chunkedCode {
-			// Get embedding for the chunk
-			embedding, err := embeddings.GetEmbedding(chunk)
-			if err != nil {
-				log.Printf("  Failed to get embedding for chunk %d in %s: %v", j+1, file, err)
-				continue
-			}
-			
-			// Create a CodeChunk struct and append to the list
-			chunks = append(chunks, storage.CodeChunk{
-				File:      file, 
-				Content:   chunk, 
-				Embedding: embedding,
-			})
-		}
-	}
-	
-	return chunks, nil
 }

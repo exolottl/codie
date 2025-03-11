@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sashabaranov/go-openai"
@@ -17,8 +18,48 @@ import (
 	"github.com/smacker/go-tree-sitter/python"
 )
 
+// RateLimiter manages rate limiting for API calls
+type RateLimiter struct {
+	ticker    *time.Ticker
+	mu        sync.Mutex
+	semaphore chan struct{}
+}
+
+// NewRateLimiter creates a new rate limiter with the specified requests per minute
+func NewRateLimiter(requestsPerMinute int, maxConcurrent int) *RateLimiter {
+	if requestsPerMinute <= 0 {
+		requestsPerMinute = 60 // Default: 1 per second
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = 5 // Default: 5 concurrent requests
+	}
+	
+	interval := time.Minute / time.Duration(requestsPerMinute)
+	return &RateLimiter{
+		ticker:    time.NewTicker(interval),
+		semaphore: make(chan struct{}, maxConcurrent),
+	}
+}
+
+// Wait blocks until a request can be made according to rate limits
+func (r *RateLimiter) Wait() {
+	r.semaphore <- struct{}{} // Acquire semaphore
+	r.mu.Lock()
+	<-r.ticker.C
+	r.mu.Unlock()
+}
+
+// Release releases the semaphore
+func (r *RateLimiter) Release() {
+	<-r.semaphore
+}
+
+// Global rate limiter for OpenAI API (3,500 RPM for ada-002 embeddings is the limit)
+// Using 3,000 to be safe
+var apiRateLimiter = NewRateLimiter(3000, 5)
+
 // Minimum delay between API calls to avoid rate limiting
-const MinDelayMS = 15
+const MinDelayMS = 10
 
 // Maximum token limit for OpenAI embeddings
 const MaxTokenLimit = 8192
@@ -98,52 +139,22 @@ var languageQueries = map[*sitter.Language][]string{
 
 // Cached parsers to avoid recreating them for each file
 var parserCache = make(map[*sitter.Language]*sitter.Parser)
+var parserMutex sync.Mutex
 
 // GetEmbedding generates an embedding for the given text using OpenAI's API
+// This is kept for backward compatibility but uses GetBatchEmbeddings internally
 func GetEmbedding(text string) ([]float32, error) {
-	// Add a delay before making the API call to avoid rate limiting
-	time.Sleep(MinDelayMS * time.Millisecond)
-	
-	// Check for empty text
-	if text = trimWhitespace(text); text == "" {
-		return nil, errors.New("cannot embed empty text")
-	}
-	
-	// Check text length (approximate token count)
-	if len(text)/4 > MaxTokenLimit {
-		return nil, fmt.Errorf("text too long for embedding, approx %d tokens exceeds limit of %d", len(text)/4, MaxTokenLimit)
-	}
-	
-	// Get API key
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	if apiKey == "" {
-		return nil, ErrMissingAPIKey
-	}
-	
-	// Create client and request
-	client := openai.NewClient(apiKey)
-	
-	// Create embedding with timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), DefaultAPITimeout)
-	defer cancel()
-	
-	resp, err := client.CreateEmbeddings(ctx, openai.EmbeddingRequest{
-		Model: openai.AdaEmbeddingV2,
-		Input: []string{text},
-	})
-	
-	// Handle errors
+	// Use batch embeddings with a batch of 1
+	embeddingMap, err := GetBatchEmbeddings([]string{text}, 1)
 	if err != nil {
-		log.Printf("Embedding API error: %v", err)
-		return nil, fmt.Errorf("%w: %v", ErrEmbeddingFailed, err)
+		return nil, err
 	}
 	
-	// Validate response
-	if len(resp.Data) == 0 || len(resp.Data[0].Embedding) == 0 {
-		return nil, errors.New("received empty embedding from API")
+	if embedding, ok := embeddingMap[text]; ok {
+		return embedding, nil
 	}
 	
-	return resp.Data[0].Embedding, nil
+	return nil, ErrEmbeddingFailed
 }
 
 // GetCodeEmbeddings generates embeddings for code with semantic chunks
@@ -184,6 +195,14 @@ func GetCodeEmbeddings(filePath string, content string) ([]CodeEmbedding, error)
 	return embeddings, nil
 }
 
+// batchResult is used to collect results from embedding API calls
+type batchResult struct {
+	Texts      []string
+	StartIndex int
+	Embeddings [][]float32
+	Error      error
+}
+
 // GetBatchEmbeddings generates embeddings for multiple texts in batch
 func GetBatchEmbeddings(texts []string, batchSize int) (map[string][]float32, error) {
 	if batchSize <= 0 {
@@ -192,12 +211,17 @@ func GetBatchEmbeddings(texts []string, batchSize int) (map[string][]float32, er
 	
 	// Filter out empty texts and check for length
 	var validTexts []string
+	var originalTexts []string // Keep track of original texts in same order
 	var invalidCount int
+	
 	for _, text := range texts {
 		if trimmed := trimWhitespace(text); trimmed != "" && len(trimmed)/4 <= MaxTokenLimit {
 			validTexts = append(validTexts, trimmed)
+			originalTexts = append(originalTexts, text) // Store original text
 		} else if trimmed != "" {
 			log.Printf("Warning: Text too long for embedding API, skipping (%d approximate tokens)", len(trimmed)/4)
+			invalidCount++
+		} else {
 			invalidCount++
 		}
 	}
@@ -219,53 +243,95 @@ func GetBatchEmbeddings(texts []string, batchSize int) (map[string][]float32, er
 	client := openai.NewClient(apiKey)
 	embeddings := make(map[string][]float32)
 	
+	// Create channels for concurrent processing
+	resultChan := make(chan batchResult, (len(validTexts)+batchSize-1)/batchSize)
+	var wg sync.WaitGroup
+	
 	// Process texts in batches
 	for i := 0; i < len(validTexts); i += batchSize {
-		// Add a delay before making each batch API call
-		time.Sleep(MinDelayMS * time.Millisecond)
-		
 		end := min(i+batchSize, len(validTexts))
 		batch := validTexts[i:end]
 		
-		fmt.Printf("Processing batch %d to %d (%d texts)\n", i, end-1, len(batch))
-		
-		// Try up to 3 times with increasing backoff
-		var resp openai.EmbeddingResponse
-		var err error
-		var success bool
-		
-		for attempt := 1; attempt <= 3; attempt++ {
-			ctx, cancel := context.WithTimeout(context.Background(), DefaultAPITimeout)
-			resp, err = client.CreateEmbeddings(ctx, openai.EmbeddingRequest{
-				Model: openai.AdaEmbeddingV2,
-				Input: batch,
-			})
-			cancel()
+		wg.Add(1)
+		go func(startIdx int, textBatch []string) {
+			defer wg.Done()
 			
-			if err == nil {
-				success = true
-				break
+			var result batchResult
+			result.Texts = textBatch
+			result.StartIndex = startIdx
+			
+			// Wait for rate limiter
+			apiRateLimiter.Wait()
+			defer apiRateLimiter.Release()
+			
+			// Try up to 3 times with increasing backoff
+			var resp openai.EmbeddingResponse
+			var err error
+			var success bool
+			
+			for attempt := 1; attempt <= 3; attempt++ {
+				ctx, cancel := context.WithTimeout(context.Background(), DefaultAPITimeout)
+				resp, err = client.CreateEmbeddings(ctx, openai.EmbeddingRequest{
+					Model: openai.AdaEmbeddingV2,
+					Input: textBatch,
+				})
+				cancel()
+				
+				if err == nil {
+					success = true
+					break
+				}
+				
+				// Check if we need to back off due to rate limiting
+				if strings.Contains(strings.ToLower(err.Error()), "rate limit") {
+					log.Printf("Rate limit hit, backing off for attempt %d", attempt)
+					time.Sleep(time.Duration(4<<attempt) * time.Second)
+				} else if attempt < 3 {
+					// For other errors, use standard backoff
+					backoffTime := time.Duration(1<<(attempt-1)) * time.Second
+					time.Sleep(backoffTime)
+				}
 			}
 			
-			log.Printf("Batch embedding API error (attempt %d): %v", attempt, err)
-			if attempt < 3 {
-				// Exponential backoff: 1s, 2s, 4s...
-				backoffTime := time.Duration(1<<(attempt-1)) * time.Second
-				log.Printf("Retrying in %v...", backoffTime)
-				time.Sleep(backoffTime)
+			if !success {
+				result.Error = fmt.Errorf("batch embedding failed after retries: %w", err)
+				resultChan <- result
+				return
 			}
+			
+			// Extract embeddings
+			if len(resp.Data) > 0 {
+				for _, item := range resp.Data {
+					if len(item.Embedding) > 0 {
+						result.Embeddings = append(result.Embeddings, item.Embedding)
+					}
+				}
+			}
+			
+			resultChan <- result
+		}(i, batch)
+	}
+	
+	// Close result channel when all goroutines finish
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+	
+	// Collect results
+	var errors []error
+	for result := range resultChan {
+		if result.Error != nil {
+			errors = append(errors, result.Error)
+			continue
 		}
 		
-		if !success {
-			log.Printf("Failed all retries for batch %d to %d", i, end-1)
-			continue // Continue with next batch
-		}
-		
-		// Validate and store the embeddings
-		if len(resp.Data) > 0 {
-			for j, item := range resp.Data {
-				if j < len(batch) && len(item.Embedding) > 0 {
-					embeddings[batch[j]] = item.Embedding
+		// Match embeddings with their original texts
+		for j, embedding := range result.Embeddings {
+			if j < len(result.Texts) {
+				originalIndex := result.StartIndex + j
+				if originalIndex < len(originalTexts) {
+					embeddings[originalTexts[originalIndex]] = embedding
 				}
 			}
 		}
@@ -273,6 +339,9 @@ func GetBatchEmbeddings(texts []string, batchSize int) (map[string][]float32, er
 	
 	// Check if we got any embeddings
 	if len(embeddings) == 0 {
+		if len(errors) > 0 {
+			return nil, fmt.Errorf("all embedding batches failed: %v", errors[0])
+		}
 		return nil, ErrEmbeddingFailed
 	}
 	
@@ -304,7 +373,8 @@ func extractSemanticChunksWithTreeSitter(filePath string, content string) ([]Cod
 		return extractGenericChunks(filename, strings.Split(content, "\n"))
 	}
 	
-	// Use or create a parser from cache
+	// Use or create a parser from cache with mutex protection
+	parserMutex.Lock()
 	var parser *sitter.Parser
 	var ok bool
 	
@@ -313,6 +383,7 @@ func extractSemanticChunksWithTreeSitter(filePath string, content string) ([]Cod
 		parser.SetLanguage(language)
 		parserCache[language] = parser
 	}
+	parserMutex.Unlock()
 	
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
