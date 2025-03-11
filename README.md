@@ -82,7 +82,7 @@ For backward compatibility, running just `go run main.go <directory path>` will 
 Codie uses a combination of technologies to provide intelligent code analysis:
 
 - **Tree-sitter** for language-specific parsing of code structures (functions, classes, methods)
-- **OpenAI's Ada-002** embedding model for semantic code processing
+- **Anthropic SmallEmbedding3** model for semantic code processing
 - **OpenAI's GPT models** for generating the final analysis
 - **Concurrent processing** for efficient handling of large codebases
 - **Rate limiting** to manage API usage and prevent throttling
