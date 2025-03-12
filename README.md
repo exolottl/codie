@@ -13,7 +13,7 @@ Codie is a powerful CLI tool designed to help developers quickly understand and 
 
 ```sh
 # Clone the repository 
-git clone https://github.com/yourusername/codie
+git clone https://github.com/exolottl/codie
 cd codie
 
 # Install dependencies
