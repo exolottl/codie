@@ -587,7 +587,7 @@ func getAISummary(prompt string, options SummaryOptions) (string, error) {
 	resp, err := client.CreateChatCompletion(
 		ctx,
 		openai.ChatCompletionRequest{
-			Model: openai.GPT4o,
+			Model: openai.O3Mini,
 			Messages: []openai.ChatCompletionMessage{
 				{
 					Role:    openai.ChatMessageRoleSystem,
