@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -8,12 +9,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+  "encoding/json"
 
 	"codie/internal/embeddings"
 	"codie/internal/fileutils"
 	"codie/internal/storage"
 	"codie/internal/summarization"
 	"github.com/charmbracelet/glamour"
+	"github.com/redis/go-redis/v9"
 	"github.com/schollz/progressbar/v3"
 )
 
@@ -40,32 +43,53 @@ func PrintUsage() {
 	fmt.Println("      --no-metrics       - Exclude code quality metrics")
 }
 
+var ctx = context.Background()
+
 // IndexCodebase processes and indexes a codebase directory
 func IndexCodebase(dir string) {
-	// Get all code files from the directory
+	// Track execution time
 	startTime := time.Now()
+	
+	// Get all code files from the directory
 	files, err := fileutils.GetCodeFiles(dir)
 	if err != nil {
 		log.Fatalf("Error scanning directory: %v", err)
 	}
-
 	if len(files) == 0 {
 		log.Fatal("No code files found in the specified directory")
 	}
-
 	fmt.Printf("Found %d code files to process\n", len(files))
-
+	
 	// Determine number of workers based on CPU cores
 	numWorkers := DefaultNumWorkers
 	if numWorkers <= 0 {
-		numWorkers = runtime.NumCPU()
+		numWorkers = runtime.NumCPU() * 4
 	}
-
+	
+	// Set up Redis client
+	ctx := context.Background()
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "redislocal",
+		DB:       0,
+		PoolSize: numWorkers + 2, // Match pool size to worker count
+	})
+	
+	// Test Redis connection
+	_, err = rdb.Ping(ctx).Result()
+	if err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	defer rdb.Close()
+	
+	// Clear previous data
+	rdb.Del(ctx, "codebase:chunks")
+	
 	// Set up concurrency channels and wait groups
 	filesChan := make(chan string, len(files))
 	resultsChan := make(chan []storage.CodeChunk, len(files))
 	errorsChan := make(chan error, len(files))
-
+	
 	// Create a progress bar
 	bar := progressbar.NewOptions(len(files),
 		progressbar.OptionSetDescription("Processing files"),
@@ -78,7 +102,7 @@ func IndexCodebase(dir string) {
 			BarStart:      "[",
 			BarEnd:        "]",
 		}))
-
+	
 	// Launch worker pool
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
@@ -96,37 +120,85 @@ func IndexCodebase(dir string) {
 			}
 		}()
 	}
-
+	
 	// Queue files for processing
 	for _, file := range files {
 		filesChan <- file
 	}
 	close(filesChan)
-
-	// Start collector goroutine
-	var allChunks []storage.CodeChunk
+	
+	// Set up collector goroutines with proper synchronization
+	var collectorWg sync.WaitGroup
+	collectorWg.Add(2)
+	
+	// Error collector
 	var processingErrors []error
-
+	var errorMutex sync.Mutex
 	go func() {
+		defer collectorWg.Done()
 		for err := range errorsChan {
+			errorMutex.Lock()
 			processingErrors = append(processingErrors, err)
+			errorMutex.Unlock()
 		}
 	}()
-
+	
+	// Results collector that writes to Redis
+	totalChunksCount := 0
+	var countMutex sync.Mutex
 	go func() {
+		defer collectorWg.Done()
 		for chunks := range resultsChan {
-			allChunks = append(allChunks, chunks...)
+			if len(chunks) == 0 {
+				continue
+			}
+			
+			pipe := rdb.Pipeline()
+			
+			for _, chunk := range chunks {
+				// Generate a unique ID for the chunk
+				chunkID := fmt.Sprintf("chunk:%s:%d", chunk.File, totalChunksCount)
+				
+				// Store embedding as a binary string (more efficient)
+				embeddingBytes, err := json.Marshal(chunk.Embedding)
+				if err != nil {
+					errorsChan <- fmt.Errorf("error serializing embedding: %w", err)
+					continue
+				}
+				
+				// Store in Redis with your actual fields
+				pipe.HSet(ctx, chunkID, map[string]interface{}{
+					"file":      chunk.File,
+					"content":   chunk.Content,
+					"embedding": embeddingBytes,
+				})
+				
+				// Add to the index set
+				pipe.SAdd(ctx, "codebase:chunks", chunkID)
+			}
+			
+			// Execute Redis pipeline
+			_, err := pipe.Exec(ctx)
+			if err != nil {
+				errorsChan <- fmt.Errorf("error writing to Redis: %w", err)
+				continue
+			}
+			
+			// Update chunk count
+			countMutex.Lock()
+			totalChunksCount += len(chunks)
+			countMutex.Unlock()
 		}
 	}()
-
+	
 	// Wait for all workers to finish
 	wg.Wait()
 	close(resultsChan)
 	close(errorsChan)
-
-	// Wait a bit for collectors to finish
-	time.Sleep(100 * time.Millisecond)
-
+	
+	// Wait for collectors to finish
+	collectorWg.Wait()
+	
 	// Report errors (but continue with saving results)
 	if len(processingErrors) > 0 {
 		fmt.Printf("\nEncountered %d errors during processing:\n", len(processingErrors))
@@ -139,18 +211,14 @@ func IndexCodebase(dir string) {
 			}
 		}
 	}
-
-	// Save the results to a JSON file
-	if len(allChunks) > 0 {
-		fmt.Printf("\nSaving %d code chunks to %s...\n", len(allChunks), DefaultEmbeddingsFile)
-		err = storage.SaveToJSON(allChunks, DefaultEmbeddingsFile)
-		if err != nil {
-			log.Fatalf("Failed to save embeddings: %v", err)
-		}
-		fmt.Printf("Successfully processed %d code chunks\n", len(allChunks))
+	
+	// Report results
+	if totalChunksCount > 0 {
+		fmt.Printf("\nSuccessfully stored %d code chunks in Redis\n", totalChunksCount)
 	} else {
 		log.Fatal("No code chunks were processed successfully")
 	}
+	
 	elapsedTime := time.Since(startTime)
 	fmt.Printf("Total indexing time: %v\n", elapsedTime)
 }
@@ -239,4 +307,3 @@ func SummarizeCodebase(dir string, args []string) {
 	fmt.Printf("Total summarizing time: %v\n", elapsedTime)
 
 }
-
