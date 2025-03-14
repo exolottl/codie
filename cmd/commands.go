@@ -9,12 +9,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/charmbracelet/glamour"
-	"github.com/schollz/progressbar/v3"
 	"codie/internal/embeddings"
 	"codie/internal/fileutils"
 	"codie/internal/storage"
 	"codie/internal/summarization"
+	"github.com/charmbracelet/glamour"
+	"github.com/schollz/progressbar/v3"
 )
 
 // Default maximum chunk size for code splitting
@@ -43,6 +43,7 @@ func PrintUsage() {
 // IndexCodebase processes and indexes a codebase directory
 func IndexCodebase(dir string) {
 	// Get all code files from the directory
+	startTime := time.Now()
 	files, err := fileutils.GetCodeFiles(dir)
 	if err != nil {
 		log.Fatalf("Error scanning directory: %v", err)
@@ -51,20 +52,20 @@ func IndexCodebase(dir string) {
 	if len(files) == 0 {
 		log.Fatal("No code files found in the specified directory")
 	}
-	
+
 	fmt.Printf("Found %d code files to process\n", len(files))
-	
+
 	// Determine number of workers based on CPU cores
 	numWorkers := DefaultNumWorkers
 	if numWorkers <= 0 {
 		numWorkers = runtime.NumCPU()
 	}
-	
+
 	// Set up concurrency channels and wait groups
 	filesChan := make(chan string, len(files))
 	resultsChan := make(chan []storage.CodeChunk, len(files))
 	errorsChan := make(chan error, len(files))
-	
+
 	// Create a progress bar
 	bar := progressbar.NewOptions(len(files),
 		progressbar.OptionSetDescription("Processing files"),
@@ -77,7 +78,7 @@ func IndexCodebase(dir string) {
 			BarStart:      "[",
 			BarEnd:        "]",
 		}))
-	
+
 	// Launch worker pool
 	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
@@ -95,37 +96,37 @@ func IndexCodebase(dir string) {
 			}
 		}()
 	}
-	
+
 	// Queue files for processing
 	for _, file := range files {
 		filesChan <- file
 	}
 	close(filesChan)
-	
+
 	// Start collector goroutine
 	var allChunks []storage.CodeChunk
 	var processingErrors []error
-	
+
 	go func() {
 		for err := range errorsChan {
 			processingErrors = append(processingErrors, err)
 		}
 	}()
-	
+
 	go func() {
 		for chunks := range resultsChan {
 			allChunks = append(allChunks, chunks...)
 		}
 	}()
-	
+
 	// Wait for all workers to finish
 	wg.Wait()
 	close(resultsChan)
 	close(errorsChan)
-	
+
 	// Wait a bit for collectors to finish
 	time.Sleep(100 * time.Millisecond)
-	
+
 	// Report errors (but continue with saving results)
 	if len(processingErrors) > 0 {
 		fmt.Printf("\nEncountered %d errors during processing:\n", len(processingErrors))
@@ -138,7 +139,7 @@ func IndexCodebase(dir string) {
 			}
 		}
 	}
-	
+
 	// Save the results to a JSON file
 	if len(allChunks) > 0 {
 		fmt.Printf("\nSaving %d code chunks to %s...\n", len(allChunks), DefaultEmbeddingsFile)
@@ -150,6 +151,8 @@ func IndexCodebase(dir string) {
 	} else {
 		log.Fatal("No code chunks were processed successfully")
 	}
+	elapsedTime := time.Since(startTime)
+	fmt.Printf("Total indexing time: %v\n", elapsedTime)
 }
 
 // processFile handles a single file, extracting and embedding its chunks
@@ -164,11 +167,11 @@ func processFile(file string) ([]storage.CodeChunk, error) {
 	if len(chunkedCode) == 0 {
 		return nil, nil // No valid chunks found
 	}
-	
+
 	// Prepare data for batch processing
 	var chunksToEmbed []string
 	fileChunks := make([]storage.CodeChunk, len(chunkedCode))
-	
+
 	for i, chunk := range chunkedCode {
 		chunksToEmbed = append(chunksToEmbed, chunk)
 		fileChunks[i] = storage.CodeChunk{
@@ -177,13 +180,13 @@ func processFile(file string) ([]storage.CodeChunk, error) {
 			// Embedding will be added later
 		}
 	}
-	
+
 	// Get embeddings for all chunks in batch
 	embedMap, err := embeddings.GetBatchEmbeddings(chunksToEmbed, DefaultBatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get embeddings: %w", err)
 	}
-	
+
 	// Associate embeddings with their chunks
 	var validChunks []storage.CodeChunk
 	for i, chunk := range fileChunks {
@@ -192,12 +195,13 @@ func processFile(file string) ([]storage.CodeChunk, error) {
 			validChunks = append(validChunks, chunk)
 		}
 	}
-	
+
 	return validChunks, nil
 }
 
 // SummarizeCodebase generates a summary of the codebase
 func SummarizeCodebase(dir string, args []string) {
+	start := time.Now()
 	embeddingsPath := DefaultEmbeddingsFile
 
 	// Check if embeddings file exists
@@ -206,10 +210,10 @@ func SummarizeCodebase(dir string, args []string) {
 		fmt.Println("Embeddings file not found. Indexing codebase first...")
 		IndexCodebase(dir)
 	}
-	
+
 	// Parse options
 	options := summarization.DefaultSummaryOptions()
-	
+
 	for _, arg := range args {
 		if strings.HasPrefix(arg, "--detail=") {
 			options.DetailLevel = strings.TrimPrefix(arg, "--detail=")
@@ -219,16 +223,20 @@ func SummarizeCodebase(dir string, args []string) {
 			options.IncludeMetrics = false
 		}
 	}
-	
+
 	// Generate summary
 	fmt.Println("Generating codebase summary...")
 	summary, err := summarization.GenerateRepoSummary(embeddingsPath, options)
 	if err != nil {
 		log.Fatalf("Failed to generate summary: %v", err)
 	}
-	
+
 	// Output the summary
 	fmt.Println("\n--- CODEBASE SUMMARY ---")
 	output, _ := glamour.Render(summary, "dark")
 	fmt.Println(output)
+	elapsedTime := time.Since(start)
+	fmt.Printf("Total summarizing time: %v\n", elapsedTime)
+
 }
+

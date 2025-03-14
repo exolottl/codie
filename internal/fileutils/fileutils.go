@@ -304,7 +304,7 @@ func ReadLargeFile(filePath string) (string, error) {
 	reader := bufio.NewReader(file)
 	
 	// Read in chunks
-	buf := make([]byte, 32*1024) // 32KB chunks
+	buf := make([]byte, 64*1024) // 32KB chunks
 	for {
 		n, err := reader.Read(buf)
 		if err != nil && err != io.EOF {
